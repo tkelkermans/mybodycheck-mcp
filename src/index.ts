@@ -80,35 +80,55 @@ async function getApi(): Promise<MyBodyCheckAPI> {
   );
 }
 
-// ── Helper: parse body_composition JSON safely ──────────────────────────
-function parseBodyComposition(raw: string): Record<string, any> | null {
+/**
+ * Resolves a UID: uses the explicit value if given, otherwise falls back to
+ * the authenticated account's primary user. Throws if neither is available.
+ */
+async function resolveUid(uid: number | undefined): Promise<number> {
+  if (typeof uid === "number") return uid;
+  const client = await getApi();
+  const defaultUid = client.getDefaultUid();
+  if (!defaultUid) {
+    throw new Error(
+      "No user ID provided and no default user found. Call 'get_users' to see available profiles, then pass one with uid=..."
+    );
+  }
+  return defaultUid;
+}
+
+// ── Helpers for response parsing ────────────────────────────────────────
+function parseExt(raw: string | undefined): Record<string, any> {
+  if (!raw) return {};
   try {
     return JSON.parse(raw);
   } catch {
-    return null;
+    return {};
   }
+}
+
+function round1(n: number | undefined): string {
+  return typeof n === "number" ? (Math.round(n * 10) / 10).toString() : "";
 }
 
 function formatWeight(record: any): string {
   const date = new Date(record.measure_time * 1000).toISOString().split("T")[0];
   const time = new Date(record.measure_time * 1000).toISOString().split("T")[1]?.slice(0, 5);
-  let out = `📅 ${date} ${time} — ${record.weight_kg} kg`;
+  let out = `📅 ${date} ${time} — ${round1(record.weight_kg)} kg`;
 
-  if (record.bmi && record.bmi !== "0") out += ` | BMI: ${record.bmi}`;
-  if (record.pbf && record.pbf !== "0") out += ` | Body Fat: ${record.pbf}%`;
+  if (record.bmi) out += ` | BMI: ${record.bmi}`;
+  if (record.pbf) out += ` | Body Fat: ${record.pbf}%`;
 
-  const bc = parseBodyComposition(record.body_composition);
-  if (bc) {
-    if (bc.bmr) out += ` | BMR: ${bc.bmr} kcal`;
-    if (bc.muscle) out += ` | Muscle: ${bc.muscle}%`;
-    if (bc.bone) out += ` | Bone: ${bc.bone} kg`;
-    if (bc.water) out += ` | Water: ${bc.water}%`;
-    if (bc.visceral_fat) out += ` | Visceral Fat: ${bc.visceral_fat}`;
-    if (bc.subcutaneous_fat) out += ` | Subcut Fat: ${bc.subcutaneous_fat}%`;
-    if (bc.protein) out += ` | Protein: ${bc.protein}%`;
-    if (bc.body_age) out += ` | Body Age: ${bc.body_age}`;
-    if (bc.body_score) out += ` | Score: ${bc.body_score}`;
-  }
+  const ext = parseExt(record.ext);
+  const bc = ext.body_composition ?? {};
+  if (bc.bmr) out += ` | BMR: ${bc.bmr} kcal`;
+  if (bc.musclePercent) out += ` | Muscle: ${round1(bc.musclePercent)}%`;
+  if (bc.boneMass) out += ` | Bone: ${round1(bc.boneMass)} kg`;
+  if (bc.moisturePercent) out += ` | Water: ${round1(bc.moisturePercent)}%`;
+  if (bc.visceralFat) out += ` | Visceral Fat: ${bc.visceralFat}`;
+  if (bc.subcutaneousFatPercent) out += ` | Subcut Fat: ${round1(bc.subcutaneousFatPercent)}%`;
+  if (bc.proteinPercent) out += ` | Protein: ${round1(bc.proteinPercent)}%`;
+  if (bc.physicalAge) out += ` | Body Age: ${bc.physicalAge}`;
+  if (bc.bodyScore) out += ` | Score: ${bc.bodyScore}`;
 
   return out;
 }
@@ -179,16 +199,35 @@ server.tool("logout", "Log out of your MyBodyCheck account.", {}, async () => {
 
 server.tool(
   "get_users",
-  "Get all user profiles linked to this account (family members, etc.).",
+  "Get all user profiles linked to this account (family members, etc.). Returns the list captured at login — these are the UIDs to pass to other tools.",
   {},
   async () => {
     try {
-      const result = await (await getApi()).getUsers();
+      const client = await getApi();
+      const session = client.getSession();
+      const users = session?.users ?? [];
+      if (users.length === 0) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "No user profiles found. Try logging out and back in to refresh.",
+            },
+          ],
+        };
+      }
+      const summary = users
+        .map(
+          (u) =>
+            `• uid=${u.uid} — ${u.nickname} (${u.sex === 1 ? "M" : "F"}, ${u.height}cm, ${u.weight}kg)`
+        )
+        .join("\n");
+      const defaultUid = client.getDefaultUid();
       return {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify(result, null, 2),
+            text: `Found ${users.length} user profile(s). Default uid: ${defaultUid}\n\n${summary}\n\nFull data:\n${JSON.stringify(users, null, 2)}`,
           },
         ],
       };
@@ -254,7 +293,7 @@ server.tool(
     "Returns weight, BMI, body fat %, muscle mass, bone mass, water %, visceral fat, " +
     "subcutaneous fat, protein, body age, body score, BMR, and segmental analysis.",
   {
-    uid: z.number().describe("User ID to fetch data for"),
+    uid: z.number().optional().describe("User ID. Omit to use the account's primary user."),
     since: z
       .string()
       .optional()
@@ -266,14 +305,15 @@ server.tool(
   },
   async ({ uid, since, format }) => {
     try {
+      const resolvedUid = await resolveUid(uid);
       const sinceTs = since ? Math.floor(new Date(since).getTime() / 1000) : 0;
-      const result = await (await getApi()).syncWeightFromServer(uid, sinceTs);
+      const result = await (await getApi()).syncWeightFromServer(resolvedUid, sinceTs);
 
       if (format === "raw") {
         return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
       }
 
-      const records = result?.data?.weight_datas || result?.weight_datas || [];
+      const records = result?.data?.weights || result?.weights || [];
       if (records.length === 0) {
         return { content: [{ type: "text" as const, text: "No weight records found." }] };
       }
@@ -292,8 +332,9 @@ server.tool(
 
       // detailed
       const detailed = records.map((r: any) => {
-        const bc = parseBodyComposition(r.body_composition) || {};
-        const seg = parseBodyComposition(r.segmental_data) || {};
+        const ext = parseExt(r.ext);
+        const bc = ext.body_composition ?? {};
+        const seg = ext.segmental_data ?? {};
         return {
           date: new Date(r.measure_time * 1000).toISOString(),
           weight_kg: r.weight_kg,
@@ -301,7 +342,7 @@ server.tool(
           body_fat_pct: r.pbf,
           ...bc,
           segmental: seg,
-          device_model: r.device_model,
+          device_model: ext.device_model,
           electrode: r.electrode,
         };
       });
@@ -318,12 +359,13 @@ server.tool(
   "get_latest_weight",
   "Get only the most recent weight/body composition measurement for a user.",
   {
-    uid: z.number().describe("User ID"),
+    uid: z.number().optional().describe("User ID. Omit to use the account's primary user."),
   },
   async ({ uid }) => {
     try {
-      const result = await (await getApi()).syncWeightFromServer(uid, 0);
-      const records = result?.data?.weight_datas || result?.weight_datas || [];
+      const resolvedUid = await resolveUid(uid);
+      const result = await (await getApi()).syncWeightFromServer(resolvedUid, 0);
+      const records = result?.data?.weights || result?.weights || [];
       if (records.length === 0) {
         return { content: [{ type: "text" as const, text: "No weight records found." }] };
       }
@@ -331,8 +373,9 @@ server.tool(
       // Sort by measure_time descending, take first
       records.sort((a: any, b: any) => b.measure_time - a.measure_time);
       const latest = records[0];
-      const bc = parseBodyComposition(latest.body_composition) || {};
-      const seg = parseBodyComposition(latest.segmental_data) || {};
+      const ext = parseExt(latest.ext);
+      const bc = ext.body_composition ?? {};
+      const seg = ext.segmental_data ?? {};
 
       const output = {
         date: new Date(latest.measure_time * 1000).toISOString(),
@@ -342,7 +385,7 @@ server.tool(
         body_fat_pct: latest.pbf,
         body_composition: bc,
         segmental_analysis: seg,
-        device_model: latest.device_model,
+        device_model: ext.device_model,
       };
 
       return {
@@ -381,14 +424,15 @@ server.tool(
   "get_ruler_data",
   "Get body girth/tape measurements (chest, waist, hips, arms, legs, etc.).",
   {
-    uid: z.number().describe("User ID"),
+    uid: z.number().optional().describe("User ID. Omit to use the account's primary user."),
     since: z.string().optional().describe("Only fetch data after this date (YYYY-MM-DD)"),
   },
   async ({ uid, since }) => {
     try {
+      const resolvedUid = await resolveUid(uid);
       const sinceTs = since ? Math.floor(new Date(since).getTime() / 1000) : 0;
-      const result = await (await getApi()).syncWeightFromServer(uid, sinceTs);
-      const rulerData = result?.data?.ruler_datas || result?.ruler_datas || [];
+      const result = await (await getApi()).syncWeightFromServer(resolvedUid, sinceTs);
+      const rulerData = result?.data?.rulers || result?.rulers || [];
 
       if (rulerData.length === 0) {
         return { content: [{ type: "text" as const, text: "No body measurement records found." }] };
@@ -409,14 +453,15 @@ server.tool(
   "get_skip_data",
   "Get jump rope / skip rope workout data.",
   {
-    uid: z.number().describe("User ID"),
+    uid: z.number().optional().describe("User ID. Omit to use the account's primary user."),
     since: z.string().optional().describe("Only fetch data after this date (YYYY-MM-DD)"),
   },
   async ({ uid, since }) => {
     try {
+      const resolvedUid = await resolveUid(uid);
       const sinceTs = since ? Math.floor(new Date(since).getTime() / 1000) : 0;
-      const result = await (await getApi()).syncWeightFromServer(uid, sinceTs);
-      const skipData = result?.data?.skip_datas || result?.skip_datas || [];
+      const result = await (await getApi()).syncWeightFromServer(resolvedUid, sinceTs);
+      const skipData = result?.data?.skips || result?.skips || [];
 
       if (skipData.length === 0) {
         return { content: [{ type: "text" as const, text: "No skip rope records found." }] };
@@ -435,11 +480,12 @@ server.tool(
   "get_skip_medals",
   "Get skip rope achievement medals for a user.",
   {
-    uid: z.number().describe("User ID"),
+    uid: z.number().optional().describe("User ID. Omit to use the account's primary user."),
   },
   async ({ uid }) => {
     try {
-      const result = await (await getApi()).getSkipMedals(uid);
+      const resolvedUid = await resolveUid(uid);
+      const result = await (await getApi()).getSkipMedals(resolvedUid);
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (err: any) {
       return { content: [{ type: "text" as const, text: `❌ ${err.message}` }], isError: true };
@@ -526,13 +572,14 @@ server.tool(
   "Full sync of all data types (weight, ruler, skip, reports) for a user from the server. " +
     "Use this for a comprehensive data pull.",
   {
-    uid: z.number().describe("User ID"),
+    uid: z.number().optional().describe("User ID. Omit to use the account's primary user."),
     since: z.string().optional().describe("Only sync data after this date (YYYY-MM-DD)"),
   },
   async ({ uid, since }) => {
     try {
+      const resolvedUid = await resolveUid(uid);
       const sinceTs = since ? Math.floor(new Date(since).getTime() / 1000) : 0;
-      const result = await (await getApi()).syncWeightFromServer(uid, sinceTs);
+      const result = await (await getApi()).syncWeightFromServer(resolvedUid, sinceTs);
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (err: any) {
       return { content: [{ type: "text" as const, text: `❌ ${err.message}` }], isError: true };

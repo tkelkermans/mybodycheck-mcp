@@ -19,6 +19,10 @@ export interface AuthSession {
   account_id: number;
   token: string;
   region: string;
+  /** Main user ID — the UID to use by default for single-user accounts. */
+  muid?: number;
+  /** User profiles attached to this account (returned by the login endpoint). */
+  users?: UserProfile[];
 }
 
 export interface UserProfile {
@@ -249,10 +253,13 @@ export class MyBodyCheckAPI {
       throw new Error(`Login failed: ${result.msg || JSON.stringify(result)}`);
     }
 
+    const accountData = result.data?.account ?? result.data;
     this.session = {
-      account_id: result.data?.account?.account_id || result.data?.account_id,
-      token: result.data?.account?.token || result.data?.token,
+      account_id: accountData?.account_id,
+      token: accountData?.token,
       region: this.baseUrl,
+      muid: accountData?.muid ?? accountData?.auid,
+      users: Array.isArray(result.data?.users) ? result.data.users : undefined,
     };
 
     return this.session;
@@ -265,6 +272,13 @@ export class MyBodyCheckAPI {
 
   getSession(): AuthSession | null {
     return this.session;
+  }
+
+  /** Returns the default UID to use: muid from login, or the first user's uid. */
+  getDefaultUid(): number | undefined {
+    if (!this.session) return undefined;
+    if (this.session.muid) return this.session.muid;
+    return this.session.users?.[0]?.uid;
   }
 
   async logout(): Promise<any> {
