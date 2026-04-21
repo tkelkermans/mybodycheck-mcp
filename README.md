@@ -33,19 +33,24 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
   "mcpServers": {
     "mybodycheck": {
       "command": "node",
-      "args": ["/path/to/mybodycheck-mcp/dist/index.js"]
+      "args": ["/path/to/mybodycheck-mcp/dist/index.js"],
+      "env": {
+        "MBC_EMAIL": "your-email@example.com",
+        "MBC_PASSWORD": "your-password",
+        "MBC_REGION": "eu"
+      }
     }
   }
 }
 ```
 
+With `MBC_EMAIL` and `MBC_PASSWORD` set, the server logs in automatically on first use and caches the session token in `~/.mybodycheck-mcp/session.json` (permissions `0600`). You won't need to re-authenticate between Claude Desktop restarts until the token is invalidated server-side.
+
+If you'd rather not store credentials in the config, omit the `env` block and use the `login` tool interactively instead — the session is still cached.
+
 ### 3. Use in conversation
 
-Once connected, start by logging in:
-
-> "Log in to MyBodyCheck with my email tristan@example.com"
-
-Then you can ask things like:
+Just ask — no explicit login needed:
 
 > "Show me my latest weight and body composition"
 > "Get my weight trend for the last 30 days"
@@ -100,6 +105,18 @@ With an 8-electrode Terraillon scale (like the Master Coach Expert), you get:
 - Body Score
 - Segmental analysis (left arm, right arm, left leg, right leg, trunk)
 
+## Configuration
+
+Environment variables (set in `claude_desktop_config.json` under `env`):
+
+| Variable       | Required | Description                                  |
+|----------------|----------|----------------------------------------------|
+| `MBC_EMAIL`    | optional | Your MyBodyCheck email — enables auto-login  |
+| `MBC_PASSWORD` | optional | Your MyBodyCheck password                    |
+| `MBC_REGION`   | optional | `eu` (default), `us`, or `cn`                |
+
+Session cache: `~/.mybodycheck-mcp/session.json` (permissions `0600`). Delete this file to force a fresh login.
+
 ## Technical Details
 
 - Built with the official [MCP TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk)
@@ -107,5 +124,5 @@ With an 8-electrode Terraillon scale (like the Master Coach Expert), you get:
 - API protocol reverse-engineered from the MyBodyCheck iOS app binary using static analysis (`otool`, `strings`, CFString parsing)
 - Authentication uses header-based signing: sorted headers are URL-encoded and MD5-hashed
 - JSON request bodies with auth state passed via custom HTTP headers
-- Session-based (login required per server session)
+- Session tokens are persisted to disk with `0600` permissions; auto-login triggers only when no cached session exists
 - Automatic region detection via server-side redirect

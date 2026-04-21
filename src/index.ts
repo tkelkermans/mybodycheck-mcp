@@ -3,15 +3,81 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { MyBodyCheckAPI } from "./api-client.js";
+import { homedir } from "os";
+import { join } from "path";
+import { mkdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from "fs";
+import { MyBodyCheckAPI, AuthSession } from "./api-client.js";
+
+// ── Session persistence ─────────────────────────────────────────────────
+// The session token survives across Claude Desktop restarts, so the user
+// doesn't re-authenticate until the server invalidates the token.
+const SESSION_DIR = join(homedir(), ".mybodycheck-mcp");
+const SESSION_FILE = join(SESSION_DIR, "session.json");
+
+function loadCachedSession(): AuthSession | null {
+  try {
+    if (!existsSync(SESSION_FILE)) return null;
+    const raw = readFileSync(SESSION_FILE, "utf8");
+    return JSON.parse(raw) as AuthSession;
+  } catch {
+    return null;
+  }
+}
+
+function saveCachedSession(session: AuthSession): void {
+  try {
+    mkdirSync(SESSION_DIR, { recursive: true, mode: 0o700 });
+    writeFileSync(SESSION_FILE, JSON.stringify(session, null, 2));
+    chmodSync(SESSION_FILE, 0o600);
+  } catch (err) {
+    console.error("Warning: could not persist session:", err);
+  }
+}
+
+function clearCachedSession(): void {
+  try {
+    if (existsSync(SESSION_FILE)) {
+      writeFileSync(SESSION_FILE, "");
+    }
+  } catch {}
+}
 
 // ── State ───────────────────────────────────────────────────────────────
 let api: MyBodyCheckAPI | null = null;
 
-function getApi(): MyBodyCheckAPI {
-  if (!api) throw new Error("Not logged in. Use the 'login' tool first.");
-  if (!api.getSession()) throw new Error("No active session. Use the 'login' tool first.");
-  return api;
+// Configuration from environment variables (set in Claude Desktop config)
+const ENV_EMAIL = process.env.MBC_EMAIL;
+const ENV_PASSWORD = process.env.MBC_PASSWORD;
+const ENV_REGION = (process.env.MBC_REGION || "eu") as "eu" | "us" | "cn";
+
+/**
+ * Returns a ready-to-use API client. Resolution order:
+ *  1. If we already have a live API instance, use it.
+ *  2. Try to restore a cached session from disk.
+ *  3. If MBC_EMAIL/MBC_PASSWORD are set, log in automatically.
+ *  4. Otherwise, throw and let the user call the `login` tool.
+ */
+async function getApi(): Promise<MyBodyCheckAPI> {
+  if (api?.getSession()) return api;
+
+  const cached = loadCachedSession();
+  if (cached?.token) {
+    api = new MyBodyCheckAPI(ENV_REGION);
+    api.setSession(cached);
+    return api;
+  }
+
+  if (ENV_EMAIL && ENV_PASSWORD) {
+    api = new MyBodyCheckAPI(ENV_REGION);
+    const session = await api.login(ENV_EMAIL, ENV_PASSWORD);
+    saveCachedSession(session);
+    return api;
+  }
+
+  throw new Error(
+    "Not authenticated. Either set MBC_EMAIL/MBC_PASSWORD in your Claude Desktop " +
+      "config, or call the 'login' tool with your credentials."
+  );
 }
 
 // ── Helper: parse body_composition JSON safely ──────────────────────────
@@ -79,11 +145,12 @@ server.tool(
     api = new MyBodyCheckAPI(region);
     try {
       const session = await api.login(email, password);
+      saveCachedSession(session);
       return {
         content: [
           {
             type: "text" as const,
-            text: `✅ Logged in successfully!\nAccount ID: ${session.account_id}\nRegion: ${region}\n\nYou can now use other tools to access your data.`,
+            text: `✅ Logged in successfully!\nAccount ID: ${session.account_id}\nRegion: ${region}\n\nSession persisted — you won't need to log in again until the token expires.`,
           },
         ],
       };
@@ -98,9 +165,10 @@ server.tool(
 
 server.tool("logout", "Log out of your MyBodyCheck account.", {}, async () => {
   try {
-    const client = getApi();
+    const client = await getApi();
     await client.logout();
     api = null;
+    clearCachedSession();
     return { content: [{ type: "text" as const, text: "✅ Logged out successfully." }] };
   } catch (err: any) {
     return { content: [{ type: "text" as const, text: `❌ ${err.message}` }], isError: true };
@@ -115,7 +183,7 @@ server.tool(
   {},
   async () => {
     try {
-      const result = await getApi().getUsers();
+      const result = await (await getApi()).getUsers();
       return {
         content: [
           {
@@ -147,7 +215,7 @@ server.tool(
   },
   async (params) => {
     try {
-      const result = await getApi().createUser(params);
+      const result = await (await getApi()).createUser(params);
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (err: any) {
       return { content: [{ type: "text" as const, text: `❌ ${err.message}` }], isError: true };
@@ -170,7 +238,7 @@ server.tool(
   },
   async (params) => {
     try {
-      const result = await getApi().updateUser(params);
+      const result = await (await getApi()).updateUser(params);
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (err: any) {
       return { content: [{ type: "text" as const, text: `❌ ${err.message}` }], isError: true };
@@ -199,7 +267,7 @@ server.tool(
   async ({ uid, since, format }) => {
     try {
       const sinceTs = since ? Math.floor(new Date(since).getTime() / 1000) : 0;
-      const result = await getApi().syncWeightFromServer(uid, sinceTs);
+      const result = await (await getApi()).syncWeightFromServer(uid, sinceTs);
 
       if (format === "raw") {
         return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
@@ -254,7 +322,7 @@ server.tool(
   },
   async ({ uid }) => {
     try {
-      const result = await getApi().syncWeightFromServer(uid, 0);
+      const result = await (await getApi()).syncWeightFromServer(uid, 0);
       const records = result?.data?.weight_datas || result?.weight_datas || [];
       if (records.length === 0) {
         return { content: [{ type: "text" as const, text: "No weight records found." }] };
@@ -299,7 +367,7 @@ server.tool(
   },
   async ({ data_ids }) => {
     try {
-      const result = await getApi().deleteWeightData(data_ids);
+      const result = await (await getApi()).deleteWeightData(data_ids);
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (err: any) {
       return { content: [{ type: "text" as const, text: `❌ ${err.message}` }], isError: true };
@@ -319,7 +387,7 @@ server.tool(
   async ({ uid, since }) => {
     try {
       const sinceTs = since ? Math.floor(new Date(since).getTime() / 1000) : 0;
-      const result = await getApi().syncWeightFromServer(uid, sinceTs);
+      const result = await (await getApi()).syncWeightFromServer(uid, sinceTs);
       const rulerData = result?.data?.ruler_datas || result?.ruler_datas || [];
 
       if (rulerData.length === 0) {
@@ -347,7 +415,7 @@ server.tool(
   async ({ uid, since }) => {
     try {
       const sinceTs = since ? Math.floor(new Date(since).getTime() / 1000) : 0;
-      const result = await getApi().syncWeightFromServer(uid, sinceTs);
+      const result = await (await getApi()).syncWeightFromServer(uid, sinceTs);
       const skipData = result?.data?.skip_datas || result?.skip_datas || [];
 
       if (skipData.length === 0) {
@@ -371,7 +439,7 @@ server.tool(
   },
   async ({ uid }) => {
     try {
-      const result = await getApi().getSkipMedals(uid);
+      const result = await (await getApi()).getSkipMedals(uid);
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (err: any) {
       return { content: [{ type: "text" as const, text: `❌ ${err.message}` }], isError: true };
@@ -389,7 +457,7 @@ server.tool(
   },
   async ({ device_id }) => {
     try {
-      const result = await getApi().getDeviceInfo(device_id);
+      const result = await (await getApi()).getDeviceInfo(device_id);
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (err: any) {
       return { content: [{ type: "text" as const, text: `❌ ${err.message}` }], isError: true };
@@ -405,7 +473,7 @@ server.tool(
   {},
   async () => {
     try {
-      const result = await getApi().getSettings();
+      const result = await (await getApi()).getSettings();
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (err: any) {
       return { content: [{ type: "text" as const, text: `❌ ${err.message}` }], isError: true };
@@ -422,7 +490,7 @@ server.tool(
   async ({ settings }) => {
     try {
       const parsed = JSON.parse(settings);
-      const result = await getApi().setSettings(parsed);
+      const result = await (await getApi()).setSettings(parsed);
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (err: any) {
       return { content: [{ type: "text" as const, text: `❌ ${err.message}` }], isError: true };
@@ -443,7 +511,7 @@ server.tool(
   },
   async ({ language }) => {
     try {
-      const result = await getApi().getFoodCategory(language);
+      const result = await (await getApi()).getFoodCategory(language);
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (err: any) {
       return { content: [{ type: "text" as const, text: `❌ ${err.message}` }], isError: true };
@@ -464,7 +532,7 @@ server.tool(
   async ({ uid, since }) => {
     try {
       const sinceTs = since ? Math.floor(new Date(since).getTime() / 1000) : 0;
-      const result = await getApi().syncWeightFromServer(uid, sinceTs);
+      const result = await (await getApi()).syncWeightFromServer(uid, sinceTs);
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (err: any) {
       return { content: [{ type: "text" as const, text: `❌ ${err.message}` }], isError: true };
@@ -478,7 +546,7 @@ server.tool(
   {},
   async () => {
     try {
-      const result = await getApi().getConfig();
+      const result = await (await getApi()).getConfig();
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (err: any) {
       return { content: [{ type: "text" as const, text: `❌ ${err.message}` }], isError: true };
