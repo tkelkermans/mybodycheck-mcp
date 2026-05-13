@@ -46,7 +46,9 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 
 With `MBC_EMAIL` and `MBC_PASSWORD` set, the server logs in automatically on first use and caches the session token in `~/.mybodycheck-mcp/session.json` (permissions `0600`). You won't need to re-authenticate between Claude Desktop restarts until the token is invalidated server-side.
 
-If you'd rather not store credentials in the config, omit the `env` block and use the `login` tool interactively instead — the session is still cached.
+If Claude Desktop reports an expired token, ask it to call `login` without arguments. The tool will refresh the session from the configured environment variables; you should not type your password into chat.
+
+If you'd rather not store credentials in the config, omit the `env` block and use the `login` tool only from a client that provides secure tool-parameter entry. The session is still cached after a successful login.
 
 ### 3. Use in conversation
 
@@ -61,7 +63,7 @@ Just ask — no explicit login needed:
 
 | Tool | Description |
 |------|-------------|
-| `login` | Authenticate with email/password (required first) |
+| `login` | Refresh or create a session. With env vars configured, call without arguments |
 | `logout` | End the session |
 | `get_users` | List all user profiles on the account |
 | `create_user` | Add a new family member profile |

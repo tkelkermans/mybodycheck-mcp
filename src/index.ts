@@ -50,6 +50,21 @@ const ENV_EMAIL = process.env.MBC_EMAIL;
 const ENV_PASSWORD = process.env.MBC_PASSWORD;
 const ENV_REGION = (process.env.MBC_REGION || "eu") as "eu" | "us" | "cn";
 
+async function loginWithCredentials(
+  email: string,
+  password: string,
+  region: "eu" | "us" | "cn"
+): Promise<AuthSession> {
+  api = new MyBodyCheckAPI(region);
+  const session = await api.login(email, password);
+  saveCachedSession(session);
+  return session;
+}
+
+function isInvalidTokenResponse(result: any): boolean {
+  return result?.code === 10000 || String(result?.msg || "").toLowerCase().includes("token");
+}
+
 /**
  * Returns a ready-to-use API client. Resolution order:
  *  1. If we already have a live API instance, use it.
@@ -64,13 +79,28 @@ async function getApi(): Promise<MyBodyCheckAPI> {
   if (cached?.token) {
     api = new MyBodyCheckAPI(ENV_REGION);
     api.setSession(cached);
-    return api;
+    const validation = await api.getSettings();
+    if (!isInvalidTokenResponse(validation)) {
+      return api;
+    }
+
+    clearCachedSession();
+    api = null;
+    if (ENV_EMAIL && ENV_PASSWORD) {
+      await loginWithCredentials(ENV_EMAIL, ENV_PASSWORD, ENV_REGION);
+      if (!api) throw new Error("Login succeeded but API client was not initialized.");
+      return api;
+    }
+
+    throw new Error(
+      "Cached MyBodyCheck session has expired. Set MBC_EMAIL/MBC_PASSWORD in your Claude Desktop " +
+        "config, then call the 'login' tool without arguments to refresh it."
+    );
   }
 
   if (ENV_EMAIL && ENV_PASSWORD) {
-    api = new MyBodyCheckAPI(ENV_REGION);
-    const session = await api.login(ENV_EMAIL, ENV_PASSWORD);
-    saveCachedSession(session);
+    await loginWithCredentials(ENV_EMAIL, ENV_PASSWORD, ENV_REGION);
+    if (!api) throw new Error("Login succeeded but API client was not initialized.");
     return api;
   }
 
@@ -152,25 +182,54 @@ const server = new McpServer({
 
 server.tool(
   "login",
-  "Log in to your MyBodyCheck / Terraillon account. Required before using any other tool.",
+  "Log in to your MyBodyCheck / Terraillon account. If MBC_EMAIL/MBC_PASSWORD are configured, call without arguments to refresh the cached session.",
   {
-    email: z.string().describe("Your MyBodyCheck account email"),
-    password: z.string().describe("Your MyBodyCheck account password"),
+    email: z
+      .string()
+      .optional()
+      .describe("Your MyBodyCheck account email. Omit to use MBC_EMAIL from the server environment."),
+    password: z
+      .string()
+      .optional()
+      .describe("Your MyBodyCheck account password. Omit to use MBC_PASSWORD from the server environment."),
     region: z
       .enum(["eu", "us", "cn"])
       .default("eu")
-      .describe("Server region: eu (Europe), us (USA), cn (China). Default: eu"),
+      .describe("Server region: eu (Europe), us (USA), cn (China). Defaults to MBC_REGION or eu."),
   },
   async ({ email, password, region }) => {
-    api = new MyBodyCheckAPI(region);
     try {
-      const session = await api.login(email, password);
-      saveCachedSession(session);
+      let session: AuthSession;
+      let source: string;
+
+      if (email || password) {
+        if (!email || !password) {
+          throw new Error("Provide both email and password, or omit both to use server environment credentials.");
+        }
+        session = await loginWithCredentials(email, password, region);
+        source = "explicit credentials";
+      } else if (ENV_EMAIL && ENV_PASSWORD) {
+        session = await loginWithCredentials(ENV_EMAIL, ENV_PASSWORD, ENV_REGION);
+        source = "environment credentials";
+      } else {
+        const client = await getApi();
+        const cached = client.getSession();
+        if (!cached) {
+          throw new Error("No cached session found. Set MBC_EMAIL and MBC_PASSWORD in the MCP server environment.");
+        }
+        session = cached;
+        source = "cached session";
+      }
+
       return {
         content: [
           {
             type: "text" as const,
-            text: `✅ Logged in successfully!\nAccount ID: ${session.account_id}\nRegion: ${region}\n\nSession persisted — you won't need to log in again until the token expires.`,
+            text:
+              `✅ Logged in successfully using ${source}.\n` +
+              `Account ID: ${session.account_id}\n` +
+              `Region: ${session.region}\n\n` +
+              "Session persisted — you won't need to log in again until the token expires.",
           },
         ],
       };
